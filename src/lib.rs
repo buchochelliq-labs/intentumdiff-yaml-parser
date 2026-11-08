@@ -267,13 +267,7 @@ fn node_to_cst(node: tree_sitter::Node<'_>, source: &[u8]) -> CstNode {
         .collect();
 
     let text = if children.is_empty() {
-        Some(
-            node.utf8_text(source)
-                .unwrap_or("")
-                .chars()
-                .take(4096)
-                .collect(),
-        )
+        Some(node.utf8_text(source).unwrap_or("").to_owned())
     } else {
         None
     };
@@ -434,5 +428,52 @@ mod tests {
     fn process_impl_whitespace_returns_valid_json() {
         let out = process_impl("   \n  ");
         t::assert_valid_json(&out, "process(whitespace)");
+    }
+
+    fn root_hash(source: &str) -> String {
+        let tree: serde_json::Value = serde_json::from_str(&process_impl(source)).unwrap();
+        assert!(tree.get("error").is_none(), "{tree}");
+        tree["structural_hash"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn long_scalar_suffix_changes_root_hash() {
+        for length in [4095, 4096, 4097, 4200, 16384] {
+            for prefix in ["a".repeat(length), "é🦀".repeat(length)] {
+                for quote in ["", "\"", "'"] {
+                    let old = format!("value: {quote}{prefix}x{quote}\n");
+                    let new = format!("value: {quote}{prefix}y{quote}\n");
+                    assert_ne!(root_hash(&old), root_hash(&new), "prefix length {length}");
+                    assert_eq!(process_impl(&old), process_impl(&old));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn long_scalar_leaf_keeps_complete_utf8_source() {
+        let payload = format!("{}suffix", "é🦀".repeat(4200));
+        for quote in ["", "\"", "'"] {
+            let source = format!("value: {quote}{payload}{quote}\n");
+            let root = parse_source(&source).unwrap();
+            fn find<'a>(node: &'a CstNode, payload: &str) -> Option<&'a CstNode> {
+                if node.text.as_deref().is_some_and(|text| text.contains(payload)) {
+                    return Some(node);
+                }
+                node.children.iter().find_map(|child| find(child, payload))
+            }
+            let leaf = find(&root, &payload).expect("complete scalar leaf");
+            let text = leaf.text_or_empty();
+            assert_eq!(leaf.end_col - leaf.start_col, text.len() as u32);
+            assert_eq!(&source[leaf.start_col as usize..leaf.end_col as usize], text);
+        }
+    }
+
+    #[test]
+    fn unchanged_long_scalar_keeps_hash_across_spacing() {
+        let payload = "é🦀".repeat(4200);
+        let compact = format!("value: \"{payload}\"\n");
+        let spaced = format!("value:   \"{payload}\"\n\n");
+        assert_eq!(root_hash(&compact), root_hash(&spaced));
     }
 }
