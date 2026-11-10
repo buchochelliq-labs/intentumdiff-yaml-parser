@@ -470,7 +470,11 @@ mod tests {
             let source = format!("value: {quote}{payload}{quote}\n");
             let root = parse_source(&source).unwrap();
             fn find<'a>(node: &'a CstNode, payload: &str) -> Option<&'a CstNode> {
-                if node.text.as_deref().is_some_and(|text| text.contains(payload)) {
+                if node
+                    .text
+                    .as_deref()
+                    .is_some_and(|text| text.contains(payload))
+                {
                     return Some(node);
                 }
                 node.children.iter().find_map(|child| find(child, payload))
@@ -478,7 +482,10 @@ mod tests {
             let leaf = find(&root, &payload).expect("complete scalar leaf");
             let text = leaf.text_or_empty();
             assert_eq!(leaf.end_col - leaf.start_col, text.len() as u32);
-            assert_eq!(&source[leaf.start_col as usize..leaf.end_col as usize], text);
+            assert_eq!(
+                &source[leaf.start_col as usize..leaf.end_col as usize],
+                text
+            );
         }
     }
 
