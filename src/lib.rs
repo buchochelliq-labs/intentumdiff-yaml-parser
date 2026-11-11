@@ -260,13 +260,26 @@ fn convert(
     Some(builder.build())
 }
 
+/// Convert a tree-sitter node into the SDK CST, dropping trivia (comments).
+///
+/// Comments are insignificant in YAML, so they must not reach the CST at all:
+/// a retained comment leaf would otherwise become the first-leaf label of its
+/// container (e.g. a leading `# ...` relabelling the `stream` root) and would
+/// feed the structural hash, turning a comment-only edit into a semantic
+/// change. A node whose only named children were comments is an empty
+/// container, not a leaf, so its (comment-bearing) source text is not kept.
 fn node_to_cst(node: tree_sitter::Node<'_>, source: &[u8]) -> CstNode {
-    let children: Vec<CstNode> = (0..node.named_child_count())
+    let named: Vec<tree_sitter::Node<'_>> = (0..node.named_child_count())
         .filter_map(|i| node.named_child(i))
+        .collect();
+    let had_named_children = !named.is_empty();
+    let children: Vec<CstNode> = named
+        .into_iter()
+        .filter(|child| !TRIVIA.contains(&child.kind()))
         .map(|child| node_to_cst(child, source))
         .collect();
 
-    let text = if children.is_empty() {
+    let text = if !had_named_children {
         Some(node.utf8_text(source).unwrap_or("").to_owned())
     } else {
         None
@@ -457,7 +470,11 @@ mod tests {
             let source = format!("value: {quote}{payload}{quote}\n");
             let root = parse_source(&source).unwrap();
             fn find<'a>(node: &'a CstNode, payload: &str) -> Option<&'a CstNode> {
-                if node.text.as_deref().is_some_and(|text| text.contains(payload)) {
+                if node
+                    .text
+                    .as_deref()
+                    .is_some_and(|text| text.contains(payload))
+                {
                     return Some(node);
                 }
                 node.children.iter().find_map(|child| find(child, payload))
@@ -465,7 +482,10 @@ mod tests {
             let leaf = find(&root, &payload).expect("complete scalar leaf");
             let text = leaf.text_or_empty();
             assert_eq!(leaf.end_col - leaf.start_col, text.len() as u32);
-            assert_eq!(&source[leaf.start_col as usize..leaf.end_col as usize], text);
+            assert_eq!(
+                &source[leaf.start_col as usize..leaf.end_col as usize],
+                text
+            );
         }
     }
 
@@ -475,5 +495,83 @@ mod tests {
         let compact = format!("value: \"{payload}\"\n");
         let spaced = format!("value:   \"{payload}\"\n\n");
         assert_eq!(root_hash(&compact), root_hash(&spaced));
+    }
+
+    /// Project a tree onto its position-independent semantic content
+    /// (type, label, structural hash, children).
+    fn semantic_projection(value: &serde_json::Value) -> serde_json::Value {
+        let children = value["children"]
+            .as_array()
+            .map(|c| c.iter().map(semantic_projection).collect::<Vec<_>>())
+            .unwrap_or_default();
+        serde_json::json!({
+            "type": value["node_type"],
+            "label": value["label"],
+            "hash": value["structural_hash"],
+            "children": children,
+        })
+    }
+
+    fn projection(source: &str) -> serde_json::Value {
+        let tree: serde_json::Value = serde_json::from_str(&process_impl(source)).unwrap();
+        assert!(tree.get("error").is_none(), "{tree}");
+        semantic_projection(&tree)
+    }
+
+    fn labels(value: &serde_json::Value, out: &mut Vec<String>) {
+        out.push(value["label"].as_str().unwrap_or_default().to_string());
+        for child in value["children"].as_array().into_iter().flatten() {
+            labels(child, out);
+        }
+    }
+
+    // buchochelliq-labs/intentumdiff-yaml-parser#5: data_config.yaml.safe_preservation
+    // and data_config.yaml.external_safe_preservation (exact assessment sources).
+    #[test]
+    fn leading_comment_does_not_change_semantic_tree() {
+        let pairs = [
+            (
+                "name: my-app\nversion: \"2.0\"\nserver:\n  host: 0.0.0.0\n  port: 8080\n  timeout: 30s\ndatabase:\n  host: db.example.com\n  port: 5432\n  name: mydb\n",
+                "# ordinary assessment comment\nname: my-app\nversion: \"2.0\"\nserver:\n  host: 0.0.0.0\n  port: 8080\n  timeout: 30s\ndatabase:\n  host: db.example.com\n  port: 5432\n  name: mydb\n",
+            ),
+            (
+                "- foo: bar\n- - baz\n  - baz\n",
+                "# ordinary source-derived control\n- foo: bar\n- - baz\n  - baz\n",
+            ),
+        ];
+        for (old, new) in pairs {
+            let (old_tree, new_tree) = (projection(old), projection(new));
+            assert_eq!(old_tree, new_tree, "comment changed semantic tree");
+            assert_eq!(new_tree["label"], "stream");
+            assert_eq!(root_hash(old), root_hash(new));
+        }
+    }
+
+    #[test]
+    fn comments_never_become_labels_or_hash_input() {
+        let base = "a: 1\nb:\n  - x\n  - y\nc: {d: 2}\n";
+        let commented = "# lead\na: 1 # trailing\n# between\nb:\n  # in seq\n  - x\n  - y # t\nc: {d: 2} # flow\n# end\n";
+        assert_eq!(projection(base), projection(commented));
+        let mut all = Vec::new();
+        labels(&projection(commented), &mut all);
+        assert!(all.iter().all(|l| !l.contains('#')), "{all:?}");
+    }
+
+    #[test]
+    fn hash_inside_scalars_is_preserved() {
+        // `#` inside quoted / non-comment positions is content, not a comment.
+        for (old, new) in [
+            ("v: \"a # b\"\n", "v: \"a # c\"\n"),
+            ("v: 'a # b'\n", "v: 'a # c'\n"),
+            ("v: a#b\n", "v: a#c\n"),
+            ("v: |\n  # b\n", "v: |\n  # c\n"),
+        ] {
+            assert_ne!(root_hash(old), root_hash(new), "{old:?} vs {new:?}");
+        }
+    }
+
+    #[test]
+    fn comment_only_document_matches_empty_document() {
+        assert_eq!(projection(""), projection("# only a comment\n"));
     }
 }
